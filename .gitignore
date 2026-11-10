@@ -10,3 +10,6 @@
 # Rendered notebook output. Participants render locally; the template ships
 # only the .qmd sources.
 *.html
+
+# R auto-plot device leftover
+Rplots.pdf

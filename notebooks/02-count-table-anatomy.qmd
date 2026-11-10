@@ -64,6 +64,61 @@ saying which. Columns: library size, number of features detected, fraction of
 zeros, the share held by the largest feature, Shannon diversity, and the
 effective number of features.*
 
+The helper below takes any features-in-rows count table and computes six
+numbers for every sample (one column of the table):
+
+- **library size** — the total number of reads in the sample, i.e. the column sum
+- **features detected** — how many features have a count above zero
+- **fraction of zeros** — the share of features that are zero (sparse-ness)
+- **largest feature share** — the fraction of the whole sample held by the single
+  most abundant feature (a dominance check)
+- **Shannon diversity** — a measure of "how many features and how evenly spread"
+  that uses both counts and evenness
+- **effective number of features** — exp(Shannon), the number of equally common
+  features that would give the same Shannon diversity; easier to read than
+  Shannon itself because it is on the scale of "number of features"
+
+```{r per-sample-metrics}
+# One function that works on any count table (features in rows, samples in cols)
+per_sample_stats <- function(counts) {
+  m <- as.matrix(counts[, -1])   # drop the feature-name column, keep samples
+  n_features <- nrow(m)
+  lib_size    <- colSums(m)
+  detected    <- colSums(m > 0)
+  frac_zeros  <- 1 - detected / n_features
+  p <- sweep(m, 2, lib_size, "/")            # each cell as a share of its sample
+  shannon <- -colSums(ifelse(p > 0, p * log(p), 0))
+  tibble(
+    sample          = colnames(m),
+    table           = "",
+    library_size    = lib_size,
+    features_detected = detected,
+    fraction_zeros  = frac_zeros,
+    largest_feature_share = ifelse(lib_size == 0, NA, apply(p, 2, max)),
+    shannon         = shannon,
+    effective_n     = exp(shannon)
+  )
+}
+
+# Run it on both tables and stack them into one data frame
+per_sample <- bind_rows(
+  per_sample_stats(species) |> mutate(table = "species"),
+  per_sample_stats(genes)   |> mutate(table = "genes")
+)
+
+per_sample
+```
+
+The checks the notebook asks for:
+
+```{r step1-checks}
+nrow(per_sample)                                   # should be 942 = 471 + 471
+per_sample |> count(table)                         # 471 rows per table
+range(per_sample$features_detected[per_sample$table == "species"])  # max 220
+range(per_sample$features_detected[per_sample$table == "genes"])    # max 14226
+per_sample[per_sample$sample == "P001_week_18", ]  # compare with sum(species$P001_week_18)
+```
+
 - Does it have 942 rows, 471 for each table?
   - *Your answer:*
 - Type `sum(species$P001_week_18)` in the console. Does it match Pi's library size for that sample?
@@ -77,6 +132,40 @@ Suggested request: *Under that data frame, add a summary table with the median,
 smallest and largest value of every column, separately for each table. Then
 write three sentences about anything unusual.*
 
+The same summary trick works on any data frame: melt it so each metric is a
+row, then take the median, smallest and largest value for each table
+separately.
+
+```{r step2-summary}
+summary_tbl <- per_sample |>
+  pivot_longer(-c(sample, table), names_to = "metric") |>  # one row per sample per metric
+  group_by(table, metric) |>
+  summarise(
+    median = median(value),
+    min    = min(value),
+    max    = max(value),
+    .groups = "drop"
+  )
+
+summary_tbl
+```
+
+Three things in this table that look unusual:
+
+1. **A very shallow species sample.** The smallest species library size is
+   **438 reads** (sample `P028_week_18`) against a median of 28,703 — about
+   65-fold below the median. It is the only sample under 1,000 reads in
+   either table.
+2. **A near-monoculture species sample.** The largest `largest_feature_share`
+   for species is **0.999** (`P107_week_34`): one feature,
+   *Lactobacillus iners*, holds 26,213 of the sample's 26,244 reads. Unlike
+   the shallow sample, its library size is perfectly normal — the problem is
+   biological, not sequencing depth.
+3. **The two tables are on completely different scales, as expected.** Gene
+   library sizes run 6.0–28.8 *million* reads with only 0.2–3.7% zeros, while
+   species tables are ~29 thousand reads with ~89% zeros. That is why the same
+   filter or transform should never be applied to both tables blindly.
+
 - Which medians were furthest from your Part 1 answers?
   - *Your answer:*
 - Did Pi mention the 438-read sample? Did it claim anything you cannot find in the table?
@@ -88,6 +177,87 @@ Suggested request: *Plot the library size of every sample four ways: a
 histogram, the same histogram on a log scale, the samples ranked from smallest
 to largest, and library size by visit. Use both tables.*
 
+Each plot shows the same 942 numbers (471 species + 471 genes), one panel per
+table. First join the visit information from the metadata table:
+
+```{r step3-join}
+per_sample_visit <- per_sample |>
+  left_join(metadata, by = c("sample" = "sample_id"))   # adds time_point, outcome, ...
+
+# friendly axis labels: 1000 -> "1k", 12000000 -> "12M"
+kfmt <- function(x) {
+  ifelse(x >= 1e6, paste0(x / 1e6, "M"),
+    ifelse(x >= 1e3, paste0(x / 1e3, "k"), x))
+}
+
+# our two colours, reused in every plot (color-blind-safe pair)
+table_cols <- c(species = "#1b9e77", genes = "#d95f02")
+visit_cols <- c(week_18 = "#66c2a5", week_24 = "#fc8d62", week_34 = "#8da0cb")
+```
+
+**Plot 1 — histogram, raw scale.** Bars show how many samples fall in each
+range of library size. Note the axis: species and genes are on different
+scales, so each panel gets its own.
+
+```{r step3-hist}
+ggplot(per_sample_visit, aes(library_size, fill = table)) +
+  geom_histogram(bins = 40, colour = "white", linewidth = 0.1) +
+  scale_fill_manual(values = table_cols) +
+  facet_wrap(~table, scales = "free_x") +
+  theme(legend.position = "none") +          # facet labels already say which is which
+  labs(title = "Library size, raw scale",
+       x = "Library size (reads)", y = "Number of samples")
+```
+
+**Plot 2 — the same histogram on a log scale.** Multiplying by 10 now moves
+you a fixed distance along the axis, so both tables become comparable and the
+extreme samples stop being invisible.
+
+```{r step3-hist-log}
+ggplot(per_sample_visit, aes(library_size, fill = table)) +
+  geom_histogram(bins = 40, colour = "white", linewidth = 0.1) +
+  scale_fill_manual(values = table_cols) +
+  scale_x_log10(labels = kfmt) +
+  facet_wrap(~table) +
+  theme(legend.position = "none") +
+  labs(title = "Library size, log scale",
+       x = "Library size (reads, log scale)", y = "Number of samples")
+```
+
+**Plot 3 — samples ranked smallest to largest.** One dot per sample. This is
+the view that shows you the whole shape of the distribution: a smooth ramp is
+healthy, and isolated dots at the edges are the outliers.
+
+```{r step3-rank}
+per_sample_visit |>
+  group_by(table) |>
+  mutate(rank = rank(library_size)) |>          # 1 = smallest, 471 = largest
+  ggplot(aes(rank, library_size, colour = table)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  scale_colour_manual(values = table_cols) +
+  facet_wrap(~table, scales = "free_y") +
+  theme(legend.position = "none") +
+  labs(title = "Samples ranked by library size",
+       x = "Rank of sample (smallest to largest)",
+       y = "Library size (reads, log scale)") +
+  scale_y_log10(labels = kfmt)
+```
+
+**Plot 4 — library size by visit.** Do some visits get sequenced more deeply
+than others? Boxplots show the median and spread at each visit; dots show
+every sample.
+
+```{r step3-by-visit}
+ggplot(per_sample_visit, aes(time_point, library_size, fill = time_point)) +
+  geom_boxplot(outlier.alpha = 0, show.legend = FALSE) +
+  scale_fill_manual(values = visit_cols) +
+  geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, colour = "grey30") +
+  facet_wrap(~table, scales = "free_y") +
+  scale_y_log10(labels = kfmt) +
+  labs(title = "Library size by visit",
+       x = "Visit", y = "Library size (reads, log scale)")
+```
+
 - Which view makes the 438-read sample obvious, and which hides it? Which would you put in a paper?
   - *Your answer:*
 
@@ -96,6 +266,57 @@ to largest, and library size by visit. Use both tables.*
 From here on, write your own requests. Ask for the plot and the Spearman
 correlation for each table, then ask how many extra genes the correlation
 amounts to between the shallowest and the deepest samples.
+
+One scatter plot per table: each dot is a sample, positioned by how many reads
+it has (x) and how many features were detected in it (y). The Spearman
+correlation is computed separately for each table and printed below.
+
+```{r step4-scatter}
+ggplot(per_sample_visit, aes(library_size, features_detected, colour = table)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = table_cols) +
+  scale_x_log10(labels = kfmt) +
+  facet_wrap(~table, scales = "free") +
+  theme(legend.position = "none") +
+  labs(title = "Features detected against library size",
+       x = "Library size (reads, log scale)",
+       y = "Features detected")
+
+# Spearman correlation: do deep samples also detect more features?
+per_sample |>
+  group_by(table) |>
+  summarise(spearman_rho = cor(library_size, features_detected, method = "spearman"),
+            .groups = "drop")
+```
+
+The two correlations are very different: about **0.06 for species** (almost no
+relationship — even a shallow sample detects a similar number of species) and
+about **0.50 for genes** (a real, positive relationship — deeper samples find
+more genes). The Spearman rank correlation asks: do samples that rank high on
+one number also rank high on the other? 0 means no pattern, 1 means perfect.
+
+How many extra genes the correlation actually buys, from the shallowest to the
+deepest sample:
+
+```{r step4-extra-genes}
+per_sample |>
+  filter(table == "genes") |>
+  slice_min(library_size, n = 1) |> mutate(which = "shallowest") |>
+  bind_rows(
+    per_sample |> filter(table == "genes") |>
+      slice_max(library_size, n = 1) |> mutate(which = "deepest")
+  ) |> print()
+
+per_sample |>
+  filter(table == "genes") |>
+  summarise(extra_genes = max(features_detected) - min(features_detected),
+            share_of_all_genes = extra_genes / nrow(genes))
+```
+
+About **312 extra genes** (2.2% of the 14,226) for a 4.8-fold increase in
+sequencing depth. Note that the sample with the fewest detected genes is not
+the shallowest sample — the relationship is real but noisy, which is exactly
+what a Spearman of 0.50 (not 0.9) means.
 
 - How many extra genes, out of 14,226? Does the plot agree with Pi?
   - *Your answer:*
